@@ -1,0 +1,32 @@
+name: Build Single HTML for GAS
+
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies and build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Inline assets into single HTML
+        run: |
+          npx html-inline -i build/index.html -o build/index_inlined.html
+
+      - name: Upload HTML Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: turbowarp-gas-html
+          path: build/index_inlined.html
