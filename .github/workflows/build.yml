@@ -16,29 +16,65 @@ jobs:
         with:
           node-version: 18
 
-      - name: Install dependencies and build
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure single-bundle webpack and build
         env:
           STANDALONE: "1"
           ROUTING_STYLE: "none"
           NODE_OPTIONS: "--max-old-space-size=4096"
         run: |
-          npm ci
+          node -e '
+            const fs = require("fs");
+            let wp = fs.readFileSync("webpack.config.js", "utf8");
+            // 動的チャンク（js/sb.jsなど）を分割せず1ファイルに強制統合するプラグインを追加
+            wp = wp.replace(
+              /plugins:\s*\[/,
+              "plugins: [ new (require(\"webpack\")).optimize.LimitChunkCountPlugin({ maxChunks: 1 }), "
+            );
+            fs.writeFileSync("webpack.config.js", wp);
+          '
           npm run build
 
-      - name: Inline scripts safely via Node
+      - name: Inline scripts and SVG assets safely
         run: |
           node -e '
             const fs = require("fs");
             const path = require("path");
             let html = fs.readFileSync("build/index.html", "utf8");
+
+            // static/assets内のSVG/フォント等をBase64データURIとしてJS内の参照に置換
+            const assetDir = "build/static/assets";
+            const assetMap = {};
+            if (fs.existsSync(assetDir)) {
+              for (const file of fs.readdirSync(assetDir)) {
+                const ext = path.extname(file).toLowerCase();
+                const mime = ext === ".svg" ? "image/svg+xml"
+                           : ext === ".png" ? "image/png"
+                           : ext === ".woff2" ? "font/woff2"
+                           : ext === ".mp3" ? "audio/mpeg"
+                           : ext === ".wav" ? "audio/wav" : null;
+                if (mime) {
+                  const b64 = fs.readFileSync(path.join(assetDir, file)).toString("base64");
+                  assetMap["static/assets/" + file] = `data:${mime};base64,${b64}`;
+                }
+              }
+            }
+
             html = html.replace(/<script\s+src="([^"]+)"><\/script>/g, (match, src) => {
               const filePath = path.join("build", src);
               if (fs.existsSync(filePath)) {
-                const js = fs.readFileSync(filePath, "utf8").replace(/<\/script>/gi, "<\\/script>");
+                let js = fs.readFileSync(filePath, "utf8");
+                for (const [key, dataUri] of Object.entries(assetMap)) {
+                  js = js.split(key).join(dataUri);
+                }
+                js = js.replace(/<\/script>/gi, "<\\/script>");
                 return "<script>" + js + "</script>";
               }
               return match;
             });
+
             html = html.replace(/<link\s+rel="manifest"[^>]*>/gi, "");
             fs.writeFileSync("build/standalone.html", html);
           '
