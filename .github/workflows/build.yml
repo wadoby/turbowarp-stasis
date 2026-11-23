@@ -16,35 +16,23 @@ jobs:
         with:
           node-version: 18
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Configure single-bundle webpack and build
+      - name: Install dependencies and build
         env:
           STANDALONE: "1"
           ROUTING_STYLE: "none"
           NODE_OPTIONS: "--max-old-space-size=4096"
         run: |
-          node -e '
-            const fs = require("fs");
-            let wp = fs.readFileSync("webpack.config.js", "utf8");
-            // 動的チャンク（js/sb.jsなど）を分割せず1ファイルに強制統合するプラグインを追加
-            wp = wp.replace(
-              /plugins:\s*\[/,
-              "plugins: [ new (require(\"webpack\")).optimize.LimitChunkCountPlugin({ maxChunks: 1 }), "
-            );
-            fs.writeFileSync("webpack.config.js", wp);
-          '
+          npm ci
           npm run build
 
-      - name: Inline scripts and SVG assets safely
+      - name: Bundle all chunks and assets into standalone.html
         run: |
           node -e '
             const fs = require("fs");
             const path = require("path");
             let html = fs.readFileSync("build/index.html", "utf8");
 
-            // static/assets内のSVG/フォント等をBase64データURIとしてJS内の参照に置換
+            // 1. static/assets内の画像・フォント・音声をBase64データURI化
             const assetDir = "build/static/assets";
             const assetMap = {};
             if (fs.existsSync(assetDir)) {
@@ -52,7 +40,10 @@ jobs:
                 const ext = path.extname(file).toLowerCase();
                 const mime = ext === ".svg" ? "image/svg+xml"
                            : ext === ".png" ? "image/png"
+                           : ext === ".jpg" || ext === ".jpeg" ? "image/jpeg"
                            : ext === ".woff2" ? "font/woff2"
+                           : ext === ".woff" ? "font/woff"
+                           : ext === ".ttf" ? "font/ttf"
                            : ext === ".mp3" ? "audio/mpeg"
                            : ext === ".wav" ? "audio/wav" : null;
                 if (mime) {
@@ -62,19 +53,65 @@ jobs:
               }
             }
 
+            const replaceAssets = (code) => {
+              let out = code;
+              for (const [key, dataUri] of Object.entries(assetMap)) {
+                out = out.split(key).join(dataUri);
+              }
+              return out;
+            };
+
+            // 2. HTMLに直書きされているメインJSをインライン化
+            const inlinedSrcs = new Set();
             html = html.replace(/<script\s+src="([^"]+)"><\/script>/g, (match, src) => {
               const filePath = path.join("build", src);
               if (fs.existsSync(filePath)) {
-                let js = fs.readFileSync(filePath, "utf8");
-                for (const [key, dataUri] of Object.entries(assetMap)) {
-                  js = js.split(key).join(dataUri);
-                }
+                inlinedSrcs.add(src.replace(/^\.?\//, ""));
+                let js = replaceAssets(fs.readFileSync(filePath, "utf8"));
                 js = js.replace(/<\/script>/gi, "<\\/script>");
                 return "<script>" + js + "</script>";
               }
               return match;
             });
 
+            // 3. 後読みチャンク（js/sb.jsなど）をすべて収集してBlob経由で即座に読み込ませる
+            const chunks = {};
+            const walkJs = (dir) => {
+              if (!fs.existsSync(dir)) return;
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                  walkJs(full);
+                } else if (entry.name.endsWith(".js")) {
+                  const rel = path.relative("build", full).replace(/\\/g, "/");
+                  if (!inlinedSrcs.has(rel)) {
+                    chunks[rel] = replaceAssets(fs.readFileSync(full, "utf8"));
+                  }
+                }
+              }
+            };
+            walkJs("build");
+
+            const chunkLoaderScript = `<script>
+              window.__INLINE_CHUNKS__ = ${JSON.stringify(chunks).replace(/<\/script>/gi, "<\\/script>")};
+              (function() {
+                const origAppend = Node.prototype.appendChild;
+                Node.prototype.appendChild = function(el) {
+                  if (el && el.tagName === "SCRIPT" && el.src) {
+                    for (const [key, code] of Object.entries(window.__INLINE_CHUNKS__)) {
+                      if (el.src.endsWith(key)) {
+                        const blob = new Blob([code], { type: "application/javascript" });
+                        el.src = URL.createObjectURL(blob);
+                        break;
+                      }
+                    }
+                  }
+                  return origAppend.call(this, el);
+                };
+              })();
+            </script>`;
+
+            html = html.replace("<head>", "<head>\n" + chunkLoaderScript);
             html = html.replace(/<link\s+rel="manifest"[^>]*>/gi, "");
             fs.writeFileSync("build/standalone.html", html);
           '
