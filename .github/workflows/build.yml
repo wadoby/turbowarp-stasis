@@ -24,7 +24,7 @@ jobs:
           npm ci
           npm run build
 
-      - name: Package cleanly without mutating JS code
+      - name: Package cleanly with safe JSON data blocks
         run: |
           cat << 'EOF' > bundle.js
           const fs = require('fs');
@@ -32,7 +32,16 @@ jobs:
 
           let html = fs.readFileSync('build/index.html', 'utf8');
 
-          // 1. static/assets内の全ファイルをBase64データURIマップとして収集（JS自体は書き換えない）
+          // HTMLのscriptタグ内で安全に扱えるエスケープ関数
+          const safeForHtmlScript = (str) => {
+            return str
+              .replace(/<\/(script)/gi, '<\\/$1')
+              .replace(/<!--/g, '<\\!--')
+              .replace(/\u2028/g, '\\u2028')
+              .replace(/\u2029/g, '\\u2029');
+          };
+
+          // 1. static/assets内の全ファイルをBase64データURIマップとして収集
           const assetDir = 'build/static/assets';
           const assetMap = {};
           if (fs.existsSync(assetDir)) {
@@ -52,23 +61,20 @@ jobs:
             }
           }
 
-          // 安全な </script> エスケープ（大文字小文字問わず終了タグのみを置換）
-          const escapeScriptEnd = (code) => code.replace(/<\/(script)/gi, '<\\/$1');
-
-          // 2. HTMLに直書きされているメインJSをインライン化（中身は一切改変しない）
+          // 2. index.html に元々書かれている <script src="..."> のみをインライン化（二重起動防止）
           const inlinedSrcs = new Set();
-          html = html.replace(/<script[^>]+src="([^"]+)"[^>]*><\/script>/gi, (match, src) => {
-            const cleanSrc = src.replace(/^\.?\//, '');
+          html = html.replace(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*><\/script>/gi, (match, src) => {
+            const cleanSrc = src.replace(/^\.?\//, '').split('?')[0];
             const filePath = path.join('build', cleanSrc);
             if (fs.existsSync(filePath)) {
               inlinedSrcs.add(cleanSrc);
-              const js = escapeScriptEnd(fs.readFileSync(filePath, 'utf8'));
-              return `<script>${js}</script>`;
+              const rawJs = fs.readFileSync(filePath, 'utf8');
+              return `<script>${safeForHtmlScript(rawJs)}</script>`;
             }
             return match;
           });
 
-          // 3. js/addons.js, js/sb.js など残りの全チャンクを収集（中身は一切改変しない）
+          // 3. js/addons.js, js/sb.js などの分割チャンクをすべて収集
           const chunks = {};
           const walkJs = (dir) => {
             if (!fs.existsSync(dir)) return;
@@ -86,20 +92,24 @@ jobs:
           };
           walkJs('build');
 
-          const safeChunks = escapeScriptEnd(JSON.stringify(chunks));
-          const safeAssets = escapeScriptEnd(JSON.stringify(assetMap));
-
-          // 4. ブラウザ実行時に script読み込み・img/svg読み込み・fetch のすべてをメモリから供給
-          const runtimeHook = `<script>
+          // 4. データは純粋な application/json タグに格納し、フックコード自体は軽量・確実に実行させる
+          const dataTags = `
+          <script id="__tw_chunks__" type="application/json">${safeForHtmlScript(JSON.stringify(chunks))}</script>
+          <script id="__tw_assets__" type="application/json">${safeForHtmlScript(JSON.stringify(assetMap))}</script>
+          <script>
           (function() {
-            const CHUNKS = ${safeChunks};
-            const ASSETS = ${safeAssets};
+            const CHUNKS = JSON.parse(document.getElementById('__tw_chunks__').textContent);
+            const ASSETS = JSON.parse(document.getElementById('__tw_assets__').textContent);
+            const blobCache = {};
 
             const resolveChunk = (url) => {
               if (!url || typeof url !== 'string') return null;
               for (const [key, code] of Object.entries(CHUNKS)) {
                 if (url.endsWith(key) || url.includes('/' + key)) {
-                  return URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+                  if (!blobCache[key]) {
+                    blobCache[key] = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+                  }
+                  return blobCache[key];
                 }
               }
               return null;
@@ -115,7 +125,6 @@ jobs:
               return null;
             };
 
-            // script.src と script.setAttribute('src') の両方をフック
             const origScriptSrc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
             Object.defineProperty(HTMLScriptElement.prototype, 'src', {
               get() { return origScriptSrc.get.call(this); },
@@ -125,7 +134,6 @@ jobs:
               }
             });
 
-            // img.src もフックしてSVG/PNGアイコンを直接供給
             const origImgSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
             Object.defineProperty(HTMLImageElement.prototype, 'src', {
               get() { return origImgSrc.get.call(this); },
@@ -135,7 +143,6 @@ jobs:
               }
             });
 
-            // setAttribute('src', ...) を経由するケースもカバー
             const origSetAttr = Element.prototype.setAttribute;
             Element.prototype.setAttribute = function(name, val) {
               if (String(name).toLowerCase() === 'src') {
@@ -150,7 +157,6 @@ jobs:
               return origSetAttr.call(this, name, val);
             };
 
-            // fetch()（フォント.woff2等）をフックしてCORSエラーを完全回避
             const origFetch = window.fetch;
             window.fetch = function(input, init) {
               const url = typeof input === 'string' ? input : (input && input.url) || '';
@@ -163,10 +169,10 @@ jobs:
           })();
           </script>`;
 
-          html = html.replace('<head>', '<head>\n' + runtimeHook);
+          html = html.replace('<head>', '<head>\n' + dataTags);
           html = html.replace(/<link\s+rel="manifest"[^>]*>/gi, '');
           fs.writeFileSync('build/standalone.html', html);
-          console.log('Done! Chunks:', Object.keys(chunks).length, 'Assets:', Object.keys(assetMap).length);
+          console.log('Success! Inlined:', [...inlinedSrcs], 'Chunks:', Object.keys(chunks).length, 'Assets:', Object.keys(assetMap).length);
           EOF
           node bundle.js
 
