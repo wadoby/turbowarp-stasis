@@ -1,4 +1,4 @@
-name: Build for GAS
+name: Build to GAS
 
 on:
   push:
