@@ -1,4 +1,4 @@
-name: Build to GAS
+name: Build Standalone HTML
 
 on:
   push:
@@ -16,13 +16,15 @@ jobs:
         with:
           node-version: 18
 
-      - name: Install dependencies and build
+      - name: Install dependencies and build standalone
+        env:
+          STANDALONE: "1"
         run: |
           npm ci
           npm run build
 
-      - name: Upload Build Artifact
+      - name: Upload Standalone HTML
         uses: actions/upload-artifact@v4
         with:
-          name: turbowarp-build
-          path: build/
+          name: turbowarp-standalone
+          path: build/index.html
