@@ -16,15 +16,35 @@ jobs:
         with:
           node-version: 18
 
-      - name: Install dependencies and build standalone
+      - name: Install dependencies and build
         env:
           STANDALONE: "1"
+          ROUTING_STYLE: "none"
+          NODE_OPTIONS: "--max-old-space-size=4096"
         run: |
           npm ci
           npm run build
+
+      - name: Inline scripts safely via Node
+        run: |
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            let html = fs.readFileSync("build/index.html", "utf8");
+            html = html.replace(/<script\s+src="([^"]+)"><\/script>/g, (match, src) => {
+              const filePath = path.join("build", src);
+              if (fs.existsSync(filePath)) {
+                const js = fs.readFileSync(filePath, "utf8").replace(/<\/script>/gi, "<\\/script>");
+                return "<script>" + js + "</script>";
+              }
+              return match;
+            });
+            html = html.replace(/<link\s+rel="manifest"[^>]*>/gi, "");
+            fs.writeFileSync("build/standalone.html", html);
+          '
 
       - name: Upload Standalone HTML
         uses: actions/upload-artifact@v4
         with:
           name: turbowarp-standalone
-          path: build/index.html
+          path: build/standalone.html
