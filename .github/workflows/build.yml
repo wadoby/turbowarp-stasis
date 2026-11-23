@@ -24,7 +24,7 @@ jobs:
           npm ci
           npm run build
 
-      - name: Bundle all chunks, assets, and fetch hooks into standalone.html
+      - name: Package cleanly without mutating JS code
         run: |
           cat << 'EOF' > bundle.js
           const fs = require('fs');
@@ -32,7 +32,7 @@ jobs:
 
           let html = fs.readFileSync('build/index.html', 'utf8');
 
-          // 1. static/assets内の全ファイルをBase64データURIマップとして収集
+          // 1. static/assets内の全ファイルをBase64データURIマップとして収集（JS自体は書き換えない）
           const assetDir = 'build/static/assets';
           const assetMap = {};
           if (fs.existsSync(assetDir)) {
@@ -52,30 +52,23 @@ jobs:
             }
           }
 
-          // JS内のアセットパス文字列をBase64データURIへ安全に置換
-          const replaceAssets = (code) => {
-            let out = code;
-            for (const [relPath, dataUri] of Object.entries(assetMap)) {
-              out = out.split(relPath).join(dataUri);
-            }
-            return out;
-          };
+          // 安全な </script> エスケープ（大文字小文字問わず終了タグのみを置換）
+          const escapeScriptEnd = (code) => code.replace(/<\/(script)/gi, '<\\/$1');
 
-          // 2. HTMLに直書きされている <script src="..."> をインライン化
+          // 2. HTMLに直書きされているメインJSをインライン化（中身は一切改変しない）
           const inlinedSrcs = new Set();
-          html = html.replace(/<script\s+src="([^"]+)"><\/script>/g, (match, src) => {
+          html = html.replace(/<script[^>]+src="([^"]+)"[^>]*><\/script>/gi, (match, src) => {
             const cleanSrc = src.replace(/^\.?\//, '');
             const filePath = path.join('build', cleanSrc);
             if (fs.existsSync(filePath)) {
               inlinedSrcs.add(cleanSrc);
-              let js = replaceAssets(fs.readFileSync(filePath, 'utf8'));
-              js = js.split('</script>').join('<\\/script>');
-              return '<script>' + js + '</script>';
+              const js = escapeScriptEnd(fs.readFileSync(filePath, 'utf8'));
+              return `<script>${js}</script>`;
             }
             return match;
           });
 
-          // 3. js/addons.js や js/sb.js などの全分割JSチャンクを収集
+          // 3. js/addons.js, js/sb.js など残りの全チャンクを収集（中身は一切改変しない）
           const chunks = {};
           const walkJs = (dir) => {
             if (!fs.existsSync(dir)) return;
@@ -86,56 +79,84 @@ jobs:
               } else if (entry.name.endsWith('.js')) {
                 const rel = path.relative('build', full).replace(/\\/g, '/');
                 if (!inlinedSrcs.has(rel)) {
-                  chunks[rel] = replaceAssets(fs.readFileSync(full, 'utf8'));
+                  chunks[rel] = fs.readFileSync(full, 'utf8');
                 }
               }
             }
           };
           walkJs('build');
 
-          const safeChunks = JSON.stringify(chunks).split('</script>').join('<\\/script>');
-          const safeAssets = JSON.stringify(assetMap).split('</script>').join('<\\/script>');
+          const safeChunks = escapeScriptEnd(JSON.stringify(chunks));
+          const safeAssets = escapeScriptEnd(JSON.stringify(assetMap));
 
-          // 4. scriptタグ生成とfetch()の両方をブラウザ上でインターセプトしてメモリから返す
+          // 4. ブラウザ実行時に script読み込み・img/svg読み込み・fetch のすべてをメモリから供給
           const runtimeHook = `<script>
-          window.__INLINE_CHUNKS__ = ${safeChunks};
-          window.__INLINE_ASSETS__ = ${safeAssets};
           (function() {
-            // 動的script読み込み（js/addons.jsなど）をすべてBlob URLに差し替え
-            const origCreate = Document.prototype.createElement;
-            Document.prototype.createElement = function(tagName, options) {
-              const el = origCreate.call(this, tagName, options);
-              if (String(tagName).toLowerCase() === 'script') {
-                const desc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
-                Object.defineProperty(el, 'src', {
-                  get() { return desc.get.call(this); },
-                  set(val) {
-                    if (typeof val === 'string') {
-                      for (const [key, code] of Object.entries(window.__INLINE_CHUNKS__)) {
-                        if (val.endsWith(key) || val.includes('/' + key)) {
-                          const blob = new Blob([code], { type: 'application/javascript' });
-                          return desc.set.call(this, URL.createObjectURL(blob));
-                        }
-                      }
-                    }
-                    return desc.set.call(this, val);
-                  }
-                });
+            const CHUNKS = ${safeChunks};
+            const ASSETS = ${safeAssets};
+
+            const resolveChunk = (url) => {
+              if (!url || typeof url !== 'string') return null;
+              for (const [key, code] of Object.entries(CHUNKS)) {
+                if (url.endsWith(key) || url.includes('/' + key)) {
+                  return URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+                }
               }
-              return el;
+              return null;
             };
 
-            // file://でのCORSブロックを防ぐため、内蔵アセットへのfetch()を横取りして直接返す
+            const resolveAsset = (url) => {
+              if (!url || typeof url !== 'string' || url.startsWith('data:')) return null;
+              for (const [key, dataUri] of Object.entries(ASSETS)) {
+                if (url.endsWith(key) || url.includes('/' + key)) {
+                  return dataUri;
+                }
+              }
+              return null;
+            };
+
+            // script.src と script.setAttribute('src') の両方をフック
+            const origScriptSrc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
+            Object.defineProperty(HTMLScriptElement.prototype, 'src', {
+              get() { return origScriptSrc.get.call(this); },
+              set(val) {
+                const blobUrl = resolveChunk(val);
+                return origScriptSrc.set.call(this, blobUrl || val);
+              }
+            });
+
+            // img.src もフックしてSVG/PNGアイコンを直接供給
+            const origImgSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+            Object.defineProperty(HTMLImageElement.prototype, 'src', {
+              get() { return origImgSrc.get.call(this); },
+              set(val) {
+                const dataUri = resolveAsset(val);
+                return origImgSrc.set.call(this, dataUri || val);
+              }
+            });
+
+            // setAttribute('src', ...) を経由するケースもカバー
+            const origSetAttr = Element.prototype.setAttribute;
+            Element.prototype.setAttribute = function(name, val) {
+              if (String(name).toLowerCase() === 'src') {
+                if (this.tagName === 'SCRIPT') {
+                  const blobUrl = resolveChunk(val);
+                  if (blobUrl) return origSetAttr.call(this, name, blobUrl);
+                } else if (this.tagName === 'IMG') {
+                  const dataUri = resolveAsset(val);
+                  if (dataUri) return origSetAttr.call(this, name, dataUri);
+                }
+              }
+              return origSetAttr.call(this, name, val);
+            };
+
+            // fetch()（フォント.woff2等）をフックしてCORSエラーを完全回避
             const origFetch = window.fetch;
             window.fetch = function(input, init) {
               const url = typeof input === 'string' ? input : (input && input.url) || '';
-              if (url.startsWith('data:')) {
-                return origFetch.call(this, url, init);
-              }
-              for (const [key, dataUri] of Object.entries(window.__INLINE_ASSETS__)) {
-                if (url.endsWith(key) || url.includes('/' + key)) {
-                  return origFetch.call(this, dataUri, init);
-                }
+              const dataUri = resolveAsset(url);
+              if (dataUri) {
+                return origFetch.call(this, dataUri, init);
               }
               return origFetch.call(this, input, init);
             };
@@ -145,6 +166,7 @@ jobs:
           html = html.replace('<head>', '<head>\n' + runtimeHook);
           html = html.replace(/<link\s+rel="manifest"[^>]*>/gi, '');
           fs.writeFileSync('build/standalone.html', html);
+          console.log('Done! Chunks:', Object.keys(chunks).length, 'Assets:', Object.keys(assetMap).length);
           EOF
           node bundle.js
 
