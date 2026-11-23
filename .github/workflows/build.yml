@@ -25,96 +25,103 @@ jobs:
           npm ci
           npm run build
 
-      - name: Bundle all chunks and assets into standalone.html
+      - name: Bundle everything cleanly into standalone.html
         run: |
-          node -e '
-            const fs = require("fs");
-            const path = require("path");
-            let html = fs.readFileSync("build/index.html", "utf8");
+          cat << 'EOF' > bundle.js
+          const fs = require('fs');
+          const path = require('path');
 
-            // 1. static/assets内の画像・フォント・音声をBase64データURI化
-            const assetDir = "build/static/assets";
-            const assetMap = {};
-            if (fs.existsSync(assetDir)) {
-              for (const file of fs.readdirSync(assetDir)) {
-                const ext = path.extname(file).toLowerCase();
-                const mime = ext === ".svg" ? "image/svg+xml"
-                           : ext === ".png" ? "image/png"
-                           : ext === ".jpg" || ext === ".jpeg" ? "image/jpeg"
-                           : ext === ".woff2" ? "font/woff2"
-                           : ext === ".woff" ? "font/woff"
-                           : ext === ".ttf" ? "font/ttf"
-                           : ext === ".mp3" ? "audio/mpeg"
-                           : ext === ".wav" ? "audio/wav" : null;
-                if (mime) {
-                  const b64 = fs.readFileSync(path.join(assetDir, file)).toString("base64");
-                  assetMap["static/assets/" + file] = `data:${mime};base64,${b64}`;
+          let html = fs.readFileSync('build/index.html', 'utf8');
+
+          // 1. static/assets内のアセットをBase64データURIとしてマップ化
+          const assetDir = 'build/static/assets';
+          const assetMap = {};
+          if (fs.existsSync(assetDir)) {
+            for (const file of fs.readdirSync(assetDir)) {
+              const ext = path.extname(file).toLowerCase();
+              const mime = ext === '.svg' ? 'image/svg+xml'
+                         : ext === '.png' ? 'image/png'
+                         : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+                         : ext === '.woff2' ? 'font/woff2'
+                         : ext === '.woff' ? 'font/woff'
+                         : ext === '.ttf' ? 'font/ttf'
+                         : ext === '.mp3' ? 'audio/mpeg'
+                         : ext === '.wav' ? 'audio/wav' : null;
+              if (mime) {
+                const b64 = fs.readFileSync(path.join(assetDir, file)).toString('base64');
+                assetMap[file] = `data:${mime};base64,${b64}`;
+              }
+            }
+          }
+
+          // JSコード内のアセットパス（"static/assets/xxxx.svg" など）を安全に置換
+          const replaceAssets = (code) => {
+            let out = code;
+            for (const [file, dataUri] of Object.entries(assetMap)) {
+              out = out.split('static/assets/' + file).join(dataUri);
+            }
+            return out;
+          };
+
+          // 2. HTMLに直接書かれている <script src="..."> をインライン化
+          const inlinedSrcs = new Set();
+          html = html.replace(/<script\s+src="([^"]+)"><\/script>/g, (match, src) => {
+            const cleanSrc = src.replace(/^\.?\//, '');
+            const filePath = path.join('build', cleanSrc);
+            if (fs.existsSync(filePath)) {
+              inlinedSrcs.add(cleanSrc);
+              let js = replaceAssets(fs.readFileSync(filePath, 'utf8'));
+              // </script> 文字列だけを安全に無害化
+              js = js.split('</script>').join('<\\/script>');
+              return '<script>' + js + '</script>';
+            }
+            return match;
+          });
+
+          // 3. js/sb.js などの動的チャンクをすべて収集
+          const chunks = {};
+          const walkJs = (dir) => {
+            if (!fs.existsSync(dir)) return;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) {
+                walkJs(full);
+              } else if (entry.name.endsWith('.js')) {
+                const rel = path.relative('build', full).replace(/\\/g, '/');
+                if (!inlinedSrcs.has(rel)) {
+                  chunks[rel] = replaceAssets(fs.readFileSync(full, 'utf8'));
                 }
               }
             }
+          };
+          walkJs('build');
 
-            const replaceAssets = (code) => {
-              let out = code;
-              for (const [key, dataUri] of Object.entries(assetMap)) {
-                out = out.split(key).join(dataUri);
-              }
-              return out;
-            };
-
-            // 2. HTMLに直書きされているメインJSをインライン化
-            const inlinedSrcs = new Set();
-            html = html.replace(/<script\s+src="([^"]+)"><\/script>/g, (match, src) => {
-              const filePath = path.join("build", src);
-              if (fs.existsSync(filePath)) {
-                inlinedSrcs.add(src.replace(/^\.?\//, ""));
-                let js = replaceAssets(fs.readFileSync(filePath, "utf8"));
-                js = js.replace(/<\/script>/gi, "<\\/script>");
-                return "<script>" + js + "</script>";
-              }
-              return match;
-            });
-
-            // 3. 後読みチャンク（js/sb.jsなど）をすべて収集してBlob経由で即座に読み込ませる
-            const chunks = {};
-            const walkJs = (dir) => {
-              if (!fs.existsSync(dir)) return;
-              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-                const full = path.join(dir, entry.name);
-                if (entry.isDirectory()) {
-                  walkJs(full);
-                } else if (entry.name.endsWith(".js")) {
-                  const rel = path.relative("build", full).replace(/\\/g, "/");
-                  if (!inlinedSrcs.has(rel)) {
-                    chunks[rel] = replaceAssets(fs.readFileSync(full, "utf8"));
+          // 4. Webpackのチャンク読み込み（head.appendChild と script.src代入）を両方フックしてBlobから読み込ませる
+          const safeChunksJson = JSON.stringify(chunks).split('</script>').join('<\\/script>');
+          const loaderScript = `<script>
+          window.__INLINE_CHUNKS__ = ${safeChunksJson};
+          (function() {
+            const origAppend = HTMLHeadElement.prototype.appendChild;
+            HTMLHeadElement.prototype.appendChild = function(el) {
+              if (el && el.tagName === 'SCRIPT' && el.src) {
+                for (const [key, code] of Object.entries(window.__INLINE_CHUNKS__)) {
+                  if (el.src.includes(key)) {
+                    const blob = new Blob([code], { type: 'application/javascript' });
+                    el.src = URL.createObjectURL(blob);
+                    break;
                   }
                 }
               }
+              return origAppend.call(this, el);
             };
-            walkJs("build");
+          })();
+          </script>`;
 
-            const chunkLoaderScript = `<script>
-              window.__INLINE_CHUNKS__ = ${JSON.stringify(chunks).replace(/<\/script>/gi, "<\\/script>")};
-              (function() {
-                const origAppend = Node.prototype.appendChild;
-                Node.prototype.appendChild = function(el) {
-                  if (el && el.tagName === "SCRIPT" && el.src) {
-                    for (const [key, code] of Object.entries(window.__INLINE_CHUNKS__)) {
-                      if (el.src.endsWith(key)) {
-                        const blob = new Blob([code], { type: "application/javascript" });
-                        el.src = URL.createObjectURL(blob);
-                        break;
-                      }
-                    }
-                  }
-                  return origAppend.call(this, el);
-                };
-              })();
-            </script>`;
-
-            html = html.replace("<head>", "<head>\n" + chunkLoaderScript);
-            html = html.replace(/<link\s+rel="manifest"[^>]*>/gi, "");
-            fs.writeFileSync("build/standalone.html", html);
-          '
+          html = html.replace('<head>', '<head>\n' + loaderScript);
+          html = html.replace(/<link\s+rel="manifest"[^>]*>/gi, '');
+          fs.writeFileSync('build/standalone.html', html);
+          EOF
+          node bundle.js
 
       - name: Upload Standalone HTML
         uses: actions/upload-artifact@v4
